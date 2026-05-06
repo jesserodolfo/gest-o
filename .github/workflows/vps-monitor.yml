@@ -1,0 +1,112 @@
+name: VPS Monitor MelaVitta
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vps-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Checkout monitor-state branch
+        uses: actions/checkout@v4
+        with:
+          ref: monitor-state
+          fetch-depth: 1
+        continue-on-error: true
+
+      - name: Run checks
+        id: check
+        env:
+          VPS_IP: 103.199.187.109
+        run: |
+          set +e
+          FAILS=""
+
+          # 1) HTTPS Chatwoot
+          CHAT_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 https://chat.melavitta.com/ 2>/dev/null)
+          if [ "$CHAT_CODE" != "200" ] && [ "$CHAT_CODE" != "302" ] && [ "$CHAT_CODE" != "301" ]; then
+            FAILS="${FAILS}\n• Chatwoot HTTPS: $CHAT_CODE"
+          fi
+
+          # 2) HTTPS n8n
+          N8N_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 https://n8n.melavitta.com/healthz 2>/dev/null)
+          if [ "$N8N_CODE" != "200" ]; then
+            FAILS="${FAILS}\n• n8n HTTPS: $N8N_CODE"
+          fi
+
+          # 3) TCP SSH (detecta VPS suspenso/desligado)
+          if ! timeout 10 bash -c "</dev/tcp/${VPS_IP}/22" 2>/dev/null; then
+            FAILS="${FAILS}\n• SSH:22 do VPS sem resposta (provável suspensão Hostinger)"
+          fi
+
+          if [ -n "$FAILS" ]; then
+            echo "current=fail" >> $GITHUB_OUTPUT
+            {
+              echo "details<<EOF"
+              echo -e "$FAILS"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+          else
+            echo "current=ok" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Read previous state
+        id: prev
+        run: |
+          if [ -f state.txt ]; then
+            echo "state=$(cat state.txt)" >> $GITHUB_OUTPUT
+          else
+            echo "state=ok" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Notify Telegram on transition
+        if: steps.prev.outputs.state != steps.check.outputs.current
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          CURRENT: ${{ steps.check.outputs.current }}
+          DETAILS: ${{ steps.check.outputs.details }}
+        run: |
+          if [ "$CURRENT" = "fail" ]; then
+            TEXT="🚨 *VPS MelaVitta com problema*${DETAILS}
+
+_Detectado pelo monitor externo (GitHub Actions)._
+Verifica painel Hostinger: https://hpanel.hostinger.com/"
+          else
+            TEXT="✅ *VPS MelaVitta voltou ao normal*
+
+_Tudo respondendo de novo._"
+          fi
+
+          PAYLOAD=$(jq -n --arg chat "$TG_CHAT_ID" --arg text "$TEXT" '{chat_id: $chat, text: $text, parse_mode: "Markdown"}')
+          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+               -H "Content-Type: application/json" \
+               -d "$PAYLOAD" > /dev/null
+
+      - name: Persist new state
+        if: steps.prev.outputs.state != steps.check.outputs.current
+        env:
+          NEW_STATE: ${{ steps.check.outputs.current }}
+        run: |
+          git config user.name "vps-monitor-bot"
+          git config user.email "vps-monitor@noreply.melavitta.com"
+
+          if ! git rev-parse --verify monitor-state >/dev/null 2>&1; then
+            git checkout --orphan monitor-state
+            git rm -rf . 2>/dev/null || true
+          fi
+
+          echo "$NEW_STATE" > state.txt
+          git add state.txt
+          git commit -m "monitor: $NEW_STATE @ $(date -u +%FT%TZ)" || true
+          git push origin monitor-state
